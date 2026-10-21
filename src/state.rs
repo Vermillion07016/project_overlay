@@ -1,0 +1,261 @@
+use std::sync::Arc;
+use project_overlay::{INDICES, VERTICES, Vertex};
+use wgpu::{Backends, BlendState, Color, ColorTargetState, ColorWrites, CommandEncoderDescriptor, CurrentSurfaceTexture, Device, DeviceDescriptor, ExperimentalFeatures, Face, Features, FragmentState, FrontFace, Instance, InstanceDescriptor, Limits, MultisampleState, Operations, PolygonMode, PrimitiveState, PrimitiveTopology, Queue, RenderPassColorAttachment, RenderPassDescriptor, RequestAdapterOptions, StoreOp, Surface, SurfaceColorSpace, SurfaceConfiguration, TextureSampleType, TextureUsages, TextureViewDescriptor, TextureViewDimension, VertexState, util::DeviceExt};
+use winit::{dpi::PhysicalSize, window::Window};
+
+use crate::texture;
+
+pub struct State {
+    surface_config: SurfaceConfiguration,
+    surface: Surface<'static>,
+    device: Device,
+    queue: Queue,
+    is_surface_configured: bool,
+    render_pipeline: wgpu::RenderPipeline,
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    num_indices: u32,
+    diffuse_bind_group: wgpu::BindGroup,
+    diffuse_texture: texture::Texture,
+}
+impl State {
+    pub fn new(window: Arc<Window>) -> Result<Self, Box<dyn std::error::Error>> {
+        println!("\n[INIT] Vulkan Grafik Alt Sistemi Başlatılıyor...");
+        let instance = Instance::new(InstanceDescriptor {
+            backends: Backends::VULKAN,
+            flags: Default::default(),
+            memory_budget_thresholds: Default::default(),
+            backend_options: Default::default(),
+            display: None
+        }); 
+        let surface = instance.create_surface(Arc::clone(&window)).unwrap();
+        let adapter = pollster::block_on(async {
+            instance.request_adapter(&RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+                apply_limit_buckets: true,
+            }).await
+        }).map_err(|_| "Uygun bir Vulkan Adaptörü (GPU) bulunamadı!")?;
+
+        // Donanım optimizasyonu takibi için ekran kartı bilgilerini yazdıralım:
+        let info = adapter.get_info();
+        println!("  ├─ [GPU Seçildi] : {} (Tür: {:?})", info.name, info.device_type);
+        println!("  ├─ [Sürücü]      : {}", info.driver);
+
+        let (device, queue) = pollster::block_on(async {
+            adapter.request_device(&DeviceDescriptor {
+                label: Some("Overlay Main Device"),
+                required_features: Features::empty(),
+                experimental_features: ExperimentalFeatures::disabled(),
+                required_limits: Limits::defaults(),
+                memory_hints: Default::default(),
+                trace: wgpu::Trace::Off,
+            }).await
+        })?;
+        println!("  ├─ [Logical Device & Queue] Başarıyla oluşturuldu.");
+
+        let surface_caps = surface.get_capabilities(&adapter);
+        let surface_format = surface_caps.formats.iter()
+            .copied()
+            .find(|f| f.is_srgb())
+            .unwrap_or(surface_caps.formats[0]);
+
+        let size = window.inner_size();
+        let config = SurfaceConfiguration {
+            usage: TextureUsages::RENDER_ATTACHMENT,
+            format: surface_format,
+            width: size.width.max(1),
+            height: size.height.max(1),
+            present_mode: surface_caps.present_modes[0],
+            alpha_mode: surface_caps.alpha_modes[0],
+            view_formats: Vec::new(),
+            desired_maximum_frame_latency: 2,
+            color_space: SurfaceColorSpace::Auto,
+        };
+
+        let diffuse_bytes = include_bytes!("../deneme.png");
+        let diffuse_texture = texture::Texture::from_bytes(&device, &queue, diffuse_bytes, "tree.png").unwrap();
+
+        let texture_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { 
+            label: Some("texture_bind_group_layout"), 
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { 
+                        sample_type: TextureSampleType::Float { filterable: true }, 
+                        view_dimension: TextureViewDimension::D2, 
+                        multisampled: false 
+                    },
+                    count: None
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(
+                        wgpu::SamplerBindingType::Filtering
+                    ),
+                    count: None
+                }
+            ] 
+        });
+        let diffuse_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor { 
+            label: Some("diffuse_bind_group"),
+            layout: &texture_bind_group_layout, 
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&diffuse_texture.view)
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&diffuse_texture.sampler)
+                }
+            ] 
+        });
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+        });
+
+        let render_pipeline_layout =
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Render Pipeline Layout"),
+            bind_group_layouts: &[Some(&texture_bind_group_layout)],
+            immediate_size: 0,
+        });
+
+        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor { 
+            label: Some("Render Pipeline"), 
+            layout: Some(&render_pipeline_layout), 
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[Some(Vertex::desc())],
+                compilation_options: Default::default()
+            },
+            fragment: Some(FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(ColorTargetState {
+                    format: config.format,
+                    blend: Some(BlendState::REPLACE),
+                    write_mask: ColorWrites::ALL,
+                })],
+                compilation_options: Default::default()
+            }),
+            primitive: PrimitiveState { 
+                topology: PrimitiveTopology::TriangleList, 
+                strip_index_format: None, 
+                front_face: FrontFace::Ccw, 
+                cull_mode: Some(Face::Back), 
+                unclipped_depth: false, 
+                polygon_mode: PolygonMode::Fill, 
+                conservative: false 
+            }, 
+            depth_stencil: None, 
+            multisample: MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false
+            }, 
+            multiview_mask: None, 
+            cache: None 
+        });
+
+        let vertex_buffer = device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Vertex Buffer"),
+                contents: bytemuck::cast_slice(VERTICES),
+                usage: wgpu::BufferUsages::VERTEX,
+            }
+        );
+        let index_buffer = device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Index Buffer"),
+                contents: bytemuck::cast_slice(INDICES),
+                usage: wgpu::BufferUsages::INDEX,
+            }
+        );
+
+        println!("  └─ [Surface] Çözünürlük: {}x{}, Format: {:?}", size.width, size.height, surface_format);
+        println!("[SUCCESS] Vulkan altyapısı tamamen ayağa kalktı.\n");
+
+        Ok(Self { 
+            surface, device, queue, render_pipeline, vertex_buffer,
+            is_surface_configured: false, surface_config: config,
+            num_indices: INDICES.len() as u32, index_buffer, diffuse_bind_group,
+            diffuse_texture
+        })
+    }
+    pub fn resize(&mut self, size: PhysicalSize<u32>) {
+        if size.width > 0 && size.height > 0 {
+            self.surface_config.width = size.width;
+            self.surface_config.height = size.height;
+            self.surface.configure(&self.device, &self.surface_config);
+            self.is_surface_configured = true
+        }
+    }
+    pub fn render(&mut self) -> Result<(), &'static str> {
+        if !self.is_surface_configured {
+            return Ok(());
+        }
+
+        let output = match self.surface.get_current_texture() {
+            CurrentSurfaceTexture::Success(texture) => texture,
+            CurrentSurfaceTexture::Suboptimal(texture) => texture,
+            CurrentSurfaceTexture::Timeout |
+            CurrentSurfaceTexture::Occluded |
+            CurrentSurfaceTexture::Validation => return Ok(()),
+            CurrentSurfaceTexture::Outdated => {
+                self.surface.configure(&self.device, &self.surface_config);
+                return Ok(());
+            },
+            CurrentSurfaceTexture::Lost => {
+                return Err("Lost device");
+            }
+        };
+
+        let view = output.texture.create_view(&TextureViewDescriptor::default());
+        let mut encoder = self.device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("Render Encoder")
+        });
+        
+        {
+            let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("Render Pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: Operations {
+                        load: wgpu::LoadOp::Clear(Color { 
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
+                            a: 0.0 
+                        }),
+                        store: StoreOp::Store
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None
+            });
+
+            render_pass.set_pipeline(&self.render_pipeline);
+            render_pass.set_bind_group(0, &self.diffuse_bind_group, &[]);
+            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            render_pass.draw_indexed(0..self.num_indices,0,0..1);
+        }
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+        self.queue.present(output);
+
+        Ok(())
+    }
+}
