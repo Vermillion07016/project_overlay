@@ -1,10 +1,9 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use anyhow::Result;
-use project_overlay::{INDICES, VERTICES, Vertex};
-use wgpu::{Adapter, Backends, BindGroup, BindGroupLayout, BlendState, Buffer, Color, ColorTargetState, ColorWrites, CommandEncoderDescriptor, CurrentSurfaceTexture, Device, DeviceDescriptor, ExperimentalFeatures, Face, Features, FragmentState, FrontFace, Instance, InstanceDescriptor, Limits, MultisampleState, Operations, PolygonMode, PresentMode, PrimitiveState, PrimitiveTopology, Queue, RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline, RequestAdapterOptions, ShaderModule, StoreOp, Surface, SurfaceColorSpace, SurfaceConfiguration, TextureFormat, TextureSampleType, TextureUsages, TextureViewDescriptor, TextureViewDimension, VertexState, util::DeviceExt};
+use project_overlay::{Vertex, create_quad_vertices};
+use wgpu::{Adapter, Backends, BindGroup, BindGroupLayout, BlendState, Color, ColorTargetState, ColorWrites, CommandEncoderDescriptor, CurrentSurfaceTexture, Device, DeviceDescriptor, ExperimentalFeatures, Face, Features, FragmentState, FrontFace, Instance, InstanceDescriptor, Limits, MultisampleState, Operations, PolygonMode, PresentMode, PrimitiveState, PrimitiveTopology, Queue, RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline, RequestAdapterOptions, ShaderModule, StoreOp, Surface, SurfaceColorSpace, SurfaceConfiguration, TextureFormat, TextureSampleType, TextureUsages, TextureViewDescriptor, TextureViewDimension, VertexState, util::DeviceExt};
 use winit::{dpi::PhysicalSize, window::Window};
-
-use crate::texture::{self, Texture};
+use crate::{sprite::Sprite, texture::Texture};
 
 pub struct State {
     surface_config: SurfaceConfiguration,
@@ -13,11 +12,9 @@ pub struct State {
     queue: Queue,
     is_surface_configured: bool,
     render_pipeline: wgpu::RenderPipeline,
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
-    num_indices: u32,
-    diffuse_bind_group: wgpu::BindGroup,
-    diffuse_texture: texture::Texture,
+    texture_bind_group_layout: BindGroupLayout,
+    textures: HashMap<String, (Texture, BindGroup)>,
+    sprites: Vec<Sprite>
 }
 impl State {
     pub fn new(window: Arc<Window>) -> Result<Self> {
@@ -57,23 +54,23 @@ impl State {
 
         // Surface configs
         let (shader, config, surface_format) = Self::create_surface_configs(&device, &surface, &adapter, &window);
-        let (texture_bind_group_layout, diffuse_texture, diffuse_bind_group) = Self::create_diffuse_things(&device, &queue)?;
+        let texture_bind_group_layout = Self::create_diffuse_things(&device)?;
 
         // Pipeline
-        let (render_pipeline, vertex_buffer, index_buffer) = Self::create_pipeline(&device, &texture_bind_group_layout, &shader, &config);
+        let render_pipeline = Self::create_pipeline(&device, &texture_bind_group_layout, &shader, &config);
 
         let size = window.inner_size();
         println!("  └─ [Surface] Çözünürlük: {}x{}, Format: {:?}", size.width, size.height, surface_format);
         println!("[SUCCESS] Vulkan altyapısı tamamen ayağa kalktı.\n");
 
         Ok(Self { 
-            surface, device, queue, render_pipeline, vertex_buffer,
+            surface, device, queue, render_pipeline,
             is_surface_configured: false, surface_config: config,
-            num_indices: INDICES.len() as u32, index_buffer, diffuse_bind_group,
-            diffuse_texture
+            textures: HashMap::new(), texture_bind_group_layout,
+            sprites: Vec::new()
         })
     }
-    fn create_pipeline(device: &Device, texture_bind_group_layout: &BindGroupLayout, shader: &ShaderModule, config: &SurfaceConfiguration) -> (RenderPipeline, Buffer, Buffer) {
+    fn create_pipeline(device: &Device, texture_bind_group_layout: &BindGroupLayout, shader: &ShaderModule, config: &SurfaceConfiguration) -> RenderPipeline {
         let render_pipeline_layout =
         device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Render Pipeline Layout"),
@@ -119,22 +116,7 @@ impl State {
             cache: None 
         });
 
-        let vertex_buffer = device.create_buffer_init(
-            &wgpu::util::BufferInitDescriptor {
-                label: Some("Vertex Buffer"),
-                contents: bytemuck::cast_slice(VERTICES),
-                usage: wgpu::BufferUsages::VERTEX,
-            }
-        );
-        let index_buffer = device.create_buffer_init(
-            &wgpu::util::BufferInitDescriptor {
-                label: Some("Index Buffer"),
-                contents: bytemuck::cast_slice(INDICES),
-                usage: wgpu::BufferUsages::INDEX,
-            }
-        );
-
-        (render_pipeline, vertex_buffer, index_buffer)
+        render_pipeline
     }
     fn create_surface_configs(device: &Device, surface: &Surface, adapter: &Adapter, window: &Window) -> (ShaderModule, SurfaceConfiguration, TextureFormat) {
         let surface_caps = surface.get_capabilities(adapter);
@@ -163,10 +145,7 @@ impl State {
         
         (shader, config, surface_format)
     }
-    fn create_diffuse_things(device: &Device, queue: &Queue) -> Result<(BindGroupLayout, Texture, BindGroup)> {
-        let diffuse_bytes = include_bytes!("../deneme.png");
-        let diffuse_texture = texture::Texture::from_bytes(&device, &queue, diffuse_bytes, "deneme.png")?;
-
+    fn create_diffuse_things(device: &Device) -> Result<BindGroupLayout> {
         let texture_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { 
             label: Some("texture_bind_group_layout"), 
             entries: &[
@@ -190,29 +169,77 @@ impl State {
                 }
             ] 
         });
-        let diffuse_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor { 
-            label: Some("diffuse_bind_group"),
-            layout: &texture_bind_group_layout, 
+
+        Ok(texture_bind_group_layout)
+    }
+    fn load_texture(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
+        let texture = Texture::from_bytes(&self.device, &self.queue, bytes, name)?;
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(&format!("{}_bind_group", name)),
+            layout: &self.texture_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&diffuse_texture.view)
+                    resource: wgpu::BindingResource::TextureView(&texture.view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&diffuse_texture.sampler)
-                }
-            ] 
+                    resource: wgpu::BindingResource::Sampler(&texture.sampler),
+                },
+            ],
+        });
+        self.textures.insert(name.to_owned(), (texture, bind_group));
+        Ok(())
+    }
+    pub fn add_sprite(&mut self, name: &str, x: f32, y: f32, w: f32, h: f32, bytes: &[u8]) -> Result<()> {
+        let (vertices, indices) = create_quad_vertices(
+            x, y, w, h, 
+            self.surface_config.width as f32, 
+            self.surface_config.height as f32
+        );
+
+        let vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Sprite Vertex Buffer"),
+            contents: bytemuck::cast_slice(&vertices),
+            usage: wgpu::BufferUsages::VERTEX,
         });
 
-        Ok((texture_bind_group_layout, diffuse_texture, diffuse_bind_group))
+        let index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Sprite Index Buffer"),
+            contents: bytemuck::cast_slice(&indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+
+        self.sprites.push(Sprite {
+            texture_name: name.to_string(), width: w, height: h,
+            x, y, vertex_buffer, index_buffer,
+        });
+
+        self.load_texture(name, bytes)?;
+        Ok(())
     }
     pub fn resize(&mut self, size: PhysicalSize<u32>) {
         if size.width > 0 && size.height > 0 {
             self.surface_config.width = size.width;
             self.surface_config.height = size.height;
             self.surface.configure(&self.device, &self.surface_config);
-            self.is_surface_configured = true
+            self.is_surface_configured = true;
+
+            let sw = size.width as f32;
+            let sh = size.height as f32;
+
+            for sprite in &mut self.sprites {
+                let (vertices, _indices) = create_quad_vertices(
+                    sprite.x, sprite.y, sprite.width, sprite.height, sw, sh
+                );
+
+                sprite.vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Resized Sprite Vertex Buffer"),
+                    contents: bytemuck::cast_slice(&vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+            }
         }
     }
     pub fn render(&mut self) -> Result<(), &'static str> {
@@ -265,10 +292,17 @@ impl State {
             });
 
             render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.set_bind_group(0, &self.diffuse_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-            render_pass.draw_indexed(0..self.num_indices,0,0..1);
+            for sprite in &self.sprites {
+                if let Some((_, bind_group)) = self.textures.get(&sprite.texture_name) {
+                    render_pass.set_bind_group(0, bind_group, &[]);
+                } else {
+
+                }
+
+                render_pass.set_vertex_buffer(0, sprite.vertex_buffer.slice(..));
+                render_pass.set_index_buffer(sprite.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                render_pass.draw_indexed(0..6,0,0..1);
+            }
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));

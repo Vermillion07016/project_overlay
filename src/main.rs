@@ -1,9 +1,9 @@
 mod state;
 mod texture;
+mod sprite;
 
 use std::sync::Arc;
-use wgpu::rwh::HasWindowHandle;
-use winit::{application::ApplicationHandler, error::EventLoopError, event::WindowEvent, event_loop::{ActiveEventLoop, ControlFlow, EventLoop}, keyboard::{KeyCode, PhysicalKey}, platform::windows::WindowAttributesExtWindows, window::{Window, WindowAttributes, WindowButtons, WindowId, WindowLevel}};
+use winit::{application::ApplicationHandler, error::EventLoopError, event::WindowEvent, event_loop::{ActiveEventLoop, ControlFlow, EventLoop}, keyboard::{KeyCode, PhysicalKey}, platform::windows::WindowAttributesExtWindows, window::{Window, WindowAttributes, WindowId, WindowLevel}};
 use crate::state::State;
 #[derive(Default)]
 struct App {
@@ -36,6 +36,8 @@ impl ApplicationHandler for App {
         // State başlatılıyor
         match State::new(Arc::clone(&window)) {
             Ok(mut state) => {
+                let _ = state.add_sprite("deneme.png", 100.0, 200.0, 150.0, 150.0, include_bytes!("../deneme.png"));
+                let _ = state.add_sprite("deneme2.png", 500.0, 600.0, 450.0, 250.0, include_bytes!("../deneme2.png"));
                 state.resize(window.inner_size());
                 self.state = Some(state);
                 self.window = Some(window);
