@@ -2,6 +2,7 @@ mod state;
 mod texture;
 
 use std::sync::Arc;
+use wgpu::rwh::HasWindowHandle;
 use winit::{application::ApplicationHandler, error::EventLoopError, event::WindowEvent, event_loop::{ActiveEventLoop, ControlFlow, EventLoop}, keyboard::{KeyCode, PhysicalKey}, platform::windows::WindowAttributesExtWindows, window::{Window, WindowAttributes, WindowButtons, WindowId, WindowLevel}};
 use crate::state::State;
 #[derive(Default)]
@@ -17,14 +18,14 @@ impl ApplicationHandler for App {
         }
         println!("Window oluşturuluyor...");
         let attr = WindowAttributes::default()
+            .with_maximized(true)
             .with_resizable(false)
             .with_skip_taskbar(true)
             .with_transparent(true)
             .with_decorations(false)
             .with_active(false)
             .with_content_protected(true)
-            .with_maximized(true)
-            .with_enabled_buttons(WindowButtons::empty());
+            .with_enabled_buttons(winit::window::WindowButtons::empty());
 
         let window = Arc::new(event_loop.create_window(attr).unwrap());
         // Tıklama geçişini (Click-through)
@@ -34,7 +35,8 @@ impl ApplicationHandler for App {
 
         // State başlatılıyor
         match State::new(Arc::clone(&window)) {
-            Ok(state) => {
+            Ok(mut state) => {
+                state.resize(window.inner_size());
                 self.state = Some(state);
                 self.window = Some(window);
                 println!("Window ve Vulkan State başarıyla oluşturuldu.");
@@ -93,7 +95,7 @@ fn main() -> Result<(), EventLoopError> {
     println!("Event loop oluşturuluyor.");
     let event_loop = EventLoop::new()?;
 
-    event_loop.set_control_flow(ControlFlow::Poll);
+    event_loop.set_control_flow(ControlFlow::Wait);
 
     println!("Event loop çalıştırılıyor.");
     event_loop.run_app(&mut App::default())?;
