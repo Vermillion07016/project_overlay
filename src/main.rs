@@ -1,106 +1,81 @@
 mod state;
-mod texture;
 mod sprite;
+mod texture;
 
-use std::sync::Arc;
-use winit::{application::ApplicationHandler, error::EventLoopError, event::WindowEvent, event_loop::{ActiveEventLoop, ControlFlow, EventLoop}, keyboard::{KeyCode, PhysicalKey}, platform::windows::WindowAttributesExtWindows, window::{Window, WindowAttributes, WindowId, WindowLevel}};
+use anyhow::Result;
+use windows_sys::Win32::{Foundation::{GetLastError, HWND, LPARAM, LRESULT, WPARAM}, Graphics::Gdi::UpdateWindow, System::LibraryLoader::GetModuleHandleA, UI::WindowsAndMessaging::{CS_HREDRAW, CS_VREDRAW, CreateWindowExA, DefWindowProcA, DispatchMessageA, HMENU, MSG, PM_REMOVE, PeekMessageA, PostQuitMessage, RegisterClassA, SW_SHOW, ShowWindow, TranslateMessage, WM_DESTROY, WM_QUIT, WNDCLASSA, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE}};
 use crate::state::State;
-#[derive(Default)]
-struct App {
-    window: Option<Arc<Window>>,
-    state: Option<State>,
-}
 
-impl ApplicationHandler for App {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
-            return;
-        }
-        println!("Window oluşturuluyor...");
-        let attr = WindowAttributes::default()
-            .with_maximized(true)
-            .with_resizable(false)
-            .with_skip_taskbar(true)
-            .with_transparent(true)
-            .with_decorations(false)
-            .with_active(false)
-            .with_content_protected(true)
-            .with_enabled_buttons(winit::window::WindowButtons::empty());
+const WINDOW_CLASS: &[u8] = b"Overlay\0";
+const WINDOW_NAME: &[u8] = b"NYA Overlay\0";
 
-        let window = Arc::new(event_loop.create_window(attr).unwrap());
-        // Tıklama geçişini (Click-through)
-        let _ = window.set_cursor_hittest(false);
-        window.set_ime_allowed(false);
-        window.set_window_level(WindowLevel::AlwaysOnTop);
-
-        // State başlatılıyor
-        match State::new(Arc::clone(&window)) {
-            Ok(mut state) => {
-                let _ = state.add_sprite("deneme.png", 100.0, 200.0, 150.0, 150.0, include_bytes!("../deneme.png"));
-                let _ = state.add_sprite("deneme2.png", 500.0, 600.0, 450.0, 250.0, include_bytes!("../deneme2.png"));
-                state.resize(window.inner_size());
-                self.state = Some(state);
-                self.window = Some(window);
-                println!("Window ve Vulkan State başarıyla oluşturuldu.");
-            }
-            Err(e) => {
-                eprintln!("Kritik Hata - State oluşturulamadı: {}", e);
-                event_loop.exit();
-            }
-        }
-    }
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        match event {
-            WindowEvent::CloseRequested => {
-                println!("Kapatma isteği alındı, çıkılıyor...");
-                event_loop.exit();
-            }
-            WindowEvent::RedrawRequested => {
-                // State ve Window yüklüyse render al
-                if let Some(state) = self.state.as_mut() {
-                    match state.render() {
-                        Ok(_) => {}
-                        Err(e) => eprintln!("Render Hatası: {:?}", e),
-                    }
-                }
-            }
-            WindowEvent::Resized(size) => {
-                if size.width > 0 && size.height > 0 {
-                    if let Some(state) = self.state.as_mut() {
-                        state.resize(size);
-                    }
-                }
-            }
-            WindowEvent::KeyboardInput { event, .. } => {
-                if event.state.is_pressed() {
-                    match event.physical_key {
-                        PhysicalKey::Code(KeyCode::Escape) => {
-                            println!("Escape tuşuna basıldı, çıkılıyor...");
-                            event_loop.exit();
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        // Sürekli akış ve akıcı bir overlay için pencerenin yeniden çizilmesini tetikliyoruz
-        if let Some(window) = self.window.as_ref() {
-            window.request_redraw();
-        }
+unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    match msg {
+        WM_DESTROY => { unsafe { PostQuitMessage(0) }; 0 }
+        _ => unsafe { DefWindowProcA(hwnd, msg, wp, lp) },
     }
 }
 
-fn main() -> Result<(), EventLoopError> {
-    println!("Event loop oluşturuluyor.");
-    let event_loop = EventLoop::new()?;
+fn main() -> Result<()> {
+    let hinstance = unsafe { GetModuleHandleA(std::ptr::null()) };
 
-    event_loop.set_control_flow(ControlFlow::Wait);
+    unsafe {
+        let wnd = WNDCLASSA {
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(wnd_proc),
+            hInstance: hinstance,
+            lpszClassName: WINDOW_CLASS.as_ptr(),
+            ..Default::default()
+        };
 
-    println!("Event loop çalıştırılıyor.");
-    event_loop.run_app(&mut App::default())?;
+        let atom = RegisterClassA(&wnd);
+        if atom == 0 {
+            return Err(anyhow::anyhow!("Class kaydedilemedi! Hata kodu: {}", GetLastError()));
+        }
+    }
+    println!("Successfully Registered The Class");
 
-    Ok(())
+    let hwnd = unsafe { 
+        CreateWindowExA(
+        WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP | WS_EX_TRANSPARENT | WS_EX_LAYERED, 
+        WINDOW_CLASS.as_ptr(), 
+        WINDOW_NAME.as_ptr(), 
+        WS_POPUP | WS_VISIBLE, 
+
+        0, 0, 
+        1920, 1080,
+
+        HWND::default(), 
+        HMENU::default(), 
+        hinstance, 
+        std::ptr::null()
+    )};
+
+    if hwnd.is_null() {
+        return Err(anyhow::anyhow!("HWND is Null! Hata kodu: {}", unsafe { GetLastError() }));
+    }
+    println!("Successfully Created Window! HWND: {:p}", hwnd);
+
+    let mut state = State::new(hwnd)?;
+    state.add_sprite("deneme1", 10.0, 10.0, 100.0, 100.0, include_bytes!("../deneme.png"))?;
+    unsafe {
+        ShowWindow(hwnd, SW_SHOW);
+        UpdateWindow(hwnd);
+
+        let mut msg: MSG = std::mem::zeroed();
+
+        'main: loop {
+            while PeekMessageA(&mut msg, HWND::default(), 0, 0, PM_REMOVE) > 0 {
+                if msg.message == WM_QUIT {
+                    break 'main;
+                }
+                TranslateMessage(&msg);
+                DispatchMessageA(&msg);
+            }
+
+            state.render().map_err(|err| anyhow::anyhow!(err))?;
+        }
+
+        Ok(())
+    }
 }

@@ -1,8 +1,10 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, os::raw::c_void};
 use anyhow::Result;
 use project_overlay::{Vertex, create_quad_vertices};
 use wgpu::{Adapter, Backends, BindGroup, BindGroupLayout, BlendState, Color, ColorTargetState, ColorWrites, CommandEncoderDescriptor, CurrentSurfaceTexture, Device, DeviceDescriptor, ExperimentalFeatures, Face, Features, FragmentState, FrontFace, Instance, InstanceDescriptor, Limits, MultisampleState, Operations, PolygonMode, PresentMode, PrimitiveState, PrimitiveTopology, Queue, RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline, RequestAdapterOptions, ShaderModule, StoreOp, Surface, SurfaceColorSpace, SurfaceConfiguration, TextureFormat, TextureSampleType, TextureUsages, TextureViewDescriptor, TextureViewDimension, VertexState, util::DeviceExt};
-use winit::{dpi::PhysicalSize, window::Window};
+use windows::{core::Interface, Win32::{Foundation::HWND, Graphics::{Dxgi::IDXGIDevice, DirectComposition::{DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual}}}};
+use windows_sys::Win32::Foundation::RECT;
+
 use crate::{sprite::Sprite, texture::Texture};
 
 pub struct State {
@@ -10,23 +12,39 @@ pub struct State {
     surface: Surface<'static>,
     device: Device,
     queue: Queue,
-    is_surface_configured: bool,
     render_pipeline: wgpu::RenderPipeline,
     texture_bind_group_layout: BindGroupLayout,
     textures: HashMap<String, (Texture, BindGroup)>,
-    sprites: Vec<Sprite>
+    sprites: Vec<Sprite>,
+    _dcomp: IDCompositionDevice,
+    _dcomp_target: IDCompositionTarget,
+    _dcomp_visual: IDCompositionVisual,
 }
 impl State {
-    pub fn new(window: Arc<Window>) -> Result<Self> {
-        println!("\n[INIT] Vulkan Grafik Alt Sistemi Başlatılıyor...");
+    pub fn new(hwnd: *const c_void) -> Result<Self> {
+        println!("\n[INIT] DX12 Grafik Alt Sistemi Başlatılıyor...");
         let instance = Instance::new(InstanceDescriptor {
-            backends: Backends::VULKAN,
+            backends: Backends::DX12,
             flags: Default::default(),
             memory_budget_thresholds: Default::default(),
-            backend_options: Default::default(),
+            backend_options: wgpu::BackendOptions {
+                dx12: wgpu::Dx12BackendOptions {
+                    presentation_system: wgpu::Dx12SwapchainKind::DxgiFromVisual,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
             display: None
         }); 
-        let surface = instance.create_surface(Arc::clone(&window)).unwrap();
+
+        let dcomp: IDCompositionDevice = unsafe { DCompositionCreateDevice(None::<&IDXGIDevice>)? };
+        let dcomp_target = unsafe { dcomp.CreateTargetForHwnd(HWND(hwnd as *mut c_void), true)? };
+        let dcomp_visual = unsafe { dcomp.CreateVisual()? };
+        unsafe { dcomp_target.SetRoot(&dcomp_visual)? };
+
+        let surface = unsafe {
+            instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::CompositionVisual(dcomp_visual.as_raw()))?
+        };
         let adapter = pollster::block_on(async {
             instance.request_adapter(&RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -34,7 +52,7 @@ impl State {
                 force_fallback_adapter: false,
                 apply_limit_buckets: true,
             }).await
-        }).map_err(|_| anyhow::anyhow!("Uygun bir Vulkan Adaptörü (GPU) bulunamadı!"))?;
+        }).map_err(|_| anyhow::anyhow!("Uygun bir DX12 Adaptörü (GPU) bulunamadı!"))?;
 
         let info = adapter.get_info();
         println!("  ├─ [GPU Seçildi] : {} (Tür: {:?})", info.name, info.device_type);
@@ -52,22 +70,20 @@ impl State {
         })?;
         println!("  ├─ [Logical Device & Queue] Başarıyla oluşturuldu.");
 
-        // Surface configs
-        let (shader, config, surface_format) = Self::create_surface_configs(&device, &surface, &adapter, &window);
+        let (shader, config, surface_format) = Self::create_surface_configs(&device, &surface, &adapter);
         let texture_bind_group_layout = Self::create_diffuse_things(&device)?;
 
-        // Pipeline
         let render_pipeline = Self::create_pipeline(&device, &texture_bind_group_layout, &shader, &config);
+        surface.configure(&device, &config);
+        unsafe { dcomp.Commit()? };
 
-        let size = window.inner_size();
-        println!("  └─ [Surface] Çözünürlük: {}x{}, Format: {:?}", size.width, size.height, surface_format);
-        println!("[SUCCESS] Vulkan altyapısı tamamen ayağa kalktı.\n");
+        println!("[SUCCESS] DX12 altyapısı tamamen ayağa kalktı.\n");
 
         Ok(Self { 
-            surface, device, queue, render_pipeline,
-            is_surface_configured: false, surface_config: config,
-            textures: HashMap::new(), texture_bind_group_layout,
-            sprites: Vec::new()
+            surface, device, queue, render_pipeline, 
+            surface_config: config, textures: HashMap::new(), 
+            texture_bind_group_layout, sprites: Vec::new(),
+            _dcomp: dcomp, _dcomp_target: dcomp_target, _dcomp_visual: dcomp_visual
         })
     }
     fn create_pipeline(device: &Device, texture_bind_group_layout: &BindGroupLayout, shader: &ShaderModule, config: &SurfaceConfiguration) -> RenderPipeline {
@@ -118,21 +134,21 @@ impl State {
 
         render_pipeline
     }
-    fn create_surface_configs(device: &Device, surface: &Surface, adapter: &Adapter, window: &Window) -> (ShaderModule, SurfaceConfiguration, TextureFormat) {
+    fn create_surface_configs(device: &Device, surface: &Surface, adapter: &Adapter) -> (ShaderModule, SurfaceConfiguration, TextureFormat) {
         let surface_caps = surface.get_capabilities(adapter);
+        println!("  ├─ [Alpha Modları] : {:?}", surface_caps.alpha_modes);
         let surface_format = surface_caps.formats.iter()
             .copied()
             .find(|f| f.is_srgb())
             .unwrap_or(surface_caps.formats[0]);
 
-        let size = window.inner_size();
         let config = SurfaceConfiguration {
             usage: TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
-            width: size.width.max(1),
-            height: size.height.max(1),
+            width: 1920,
+            height: 1080,
             present_mode: surface_caps.present_modes.iter().find(|mode| **mode == PresentMode::Fifo).map(|a| *a).unwrap_or(surface_caps.present_modes[0]),
-            alpha_mode: surface_caps.alpha_modes[0],
+            alpha_mode: surface_caps.alpha_modes.iter().copied().find(|m| *m == wgpu::CompositeAlphaMode::PreMultiplied).unwrap_or(surface_caps.alpha_modes[0]),
             view_formats: Vec::new(),
             desired_maximum_frame_latency: 2,
             color_space: SurfaceColorSpace::Auto,
@@ -219,15 +235,16 @@ impl State {
         self.load_texture(name, bytes)?;
         Ok(())
     }
-    pub fn resize(&mut self, size: PhysicalSize<u32>) {
-        if size.width > 0 && size.height > 0 {
-            self.surface_config.width = size.width;
-            self.surface_config.height = size.height;
-            self.surface.configure(&self.device, &self.surface_config);
-            self.is_surface_configured = true;
+    pub fn resize(&mut self, rect: RECT) {
+        let (w, h) = ((rect.right - rect.left) as u32, (rect.bottom - rect.top) as u32);
 
-            let sw = size.width as f32;
-            let sh = size.height as f32;
+        if w > 0 && h > 0 {
+            self.surface_config.width = w;
+            self.surface_config.height = h;
+            self.surface.configure(&self.device, &self.surface_config);
+
+            let sw = w as f32;
+            let sh = h as f32;
 
             for sprite in &mut self.sprites {
                 let (vertices, _indices) = create_quad_vertices(
@@ -243,10 +260,6 @@ impl State {
         }
     }
     pub fn render(&mut self) -> Result<(), &'static str> {
-        if !self.is_surface_configured {
-            return Ok(());
-        }
-
         let output = match self.surface.get_current_texture() {
             CurrentSurfaceTexture::Success(texture) => texture,
             CurrentSurfaceTexture::Suboptimal(texture) => texture,
